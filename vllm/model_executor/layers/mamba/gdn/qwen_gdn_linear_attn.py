@@ -28,6 +28,7 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -56,7 +57,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.inc import INCConfig
-from vllm.model_executor.layers.utils import default_unquantized_gemm
+from vllm.model_executor.layers.utils import cuda_unquantized_gemm
 from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
@@ -115,6 +116,9 @@ MAX_FUSED_GDN_MTP_TOKENS = 8
 # stream. On GB300, across Qwen3.5/3.8 shapes, quant formats and TP 1-8, the first
 # regression was at 272 tokens (27B BF16 TP8).
 _BA_PROJ_OVERLAP_MAX_TOKENS = 256
+# FlashInfer's chunk-parallel (CP) route has a fixed ~175 us cost per call.
+# Up to ~4k tokens the regular route is 1.4-5.7x faster per call.
+_FI_GDN_PREFILL_CP_MIN_TOKENS = 8192
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
@@ -173,7 +177,8 @@ def _resolve_gdn_prefill_backend(
 
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
-    * Blackwell (SM10.x) with ``head_k_dim == 128``;
+    * Blackwell (SM10.x or SM11.x) with ``head_k_dim == 128``,
+      ``cuda_runtime >= 13``;
 
     AITER FlyDSL GDN prefill kernels are chosen when:
     * "aiter_flydsl" is requested, or "auto" is requested on gfx942/gfx950;
@@ -264,11 +269,17 @@ def _resolve_gdn_prefill_backend(
         supports_flashinfer = True
         supports_cutedsl = True
     elif (
+        current_platform.is_device_capability_family(110)
+        and head_k_dim == 128
+        and current_platform.get_cuda_runtime_major() >= 13
+    ):
+        supports_cutedsl = True
+    elif (
         current_platform.is_device_capability_family(120)
         and head_k_dim == 128
         and current_platform.get_cuda_runtime_major() >= 13
     ):
-        # The in-tree CuteDSL kernel targets SM100 only, so it stays off here.
+        # The in-tree CuteDSL kernel targets SM100/SM110 only, so it stays off here.
         supports_flashinfer = True
 
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
@@ -577,6 +588,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         gqa_interleaved_layout=False,
         reduce_results: bool = True,
         overlap_ba_proj: bool = False,
+        fused_gdn_gated_rms_norm: (
+            Callable[..., torch.Tensor | QuantizedActivation] | None
+        ) = None,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
@@ -649,7 +663,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             overlap_ba_proj
             and current_platform.is_cuda()
             and isinstance(ba_method, UnquantizedLinearMethod)
-            and ba_method._gemm_impl is default_unquantized_gemm
+            and ba_method._gemm_impl is cuda_unquantized_gemm
             and not vllm_config.parallel_config.use_ubatching
             and vllm_config.lora_config is None
         ):
@@ -733,10 +747,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
-        # Off by default; the Qwen3.5 NVIDIA variant installs a fused gated
-        # RMS norm that reads z as a strided view of the packed qkvz
-        # projection, removing the z reshape copy (see Qwen3_5DecoderLayer).
-        self._fused_gdn_gated_rms_norm: Callable[..., None] | None = None
+        # Off by default; the Qwen3.5 NVIDIA variant passes a fused gated RMS
+        # norm that reads z strided from the packed qkvz projection and
+        # returns the out_proj input: `out`, or a pre-quantized activation.
+        self._fused_gdn_gated_rms_norm = fused_gdn_gated_rms_norm
         self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
         if self.gdn_decode_kernel == "cuda" and current_platform.is_cuda_alike():
             reason = self._fused_gdn_decode_unsupported_reason(vllm_config)
@@ -1168,18 +1182,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
+        qkvz_input: QuantizedActivation | None = None,
     ) -> torch.Tensor:
         """Forward pass with three parts:
         1. Input projection
         2. Core attention (custom op)
         3. Output projection
+
+        ``qkvz_input``, if given, is ``hidden_states`` pre-quantized for
+        in_proj_qkvz; in_proj_ba still reads ``hidden_states``.
         """
         num_tokens = hidden_states.size(0)
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
+        qkvz_in = hidden_states if qkvz_input is None else qkvz_input
         if self._ba_stream is None:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
             ba, _ = self.in_proj_ba(hidden_states)
         else:
             # Hide the tiny ba GEMM on the aux stream. Only under CUDA graph
@@ -1188,7 +1207,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # regressed block-FP8 qkvz from ~100 tokens.
             start, done = self._ba_events
             mixed_qkvz, (ba,) = execute_in_parallel(
-                lambda: self.in_proj_qkvz(hidden_states)[0],
+                lambda: self.in_proj_qkvz(qkvz_in)[0],
                 [lambda: self.in_proj_ba(hidden_states)[0]],
                 start,
                 [done],
@@ -1264,18 +1283,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and not self.gqa_interleaved_layout
         ):
             out2d = core_attn_out.view(num_tokens, -1)
-            self._fused_gdn_gated_rms_norm(
+            out_proj_input = self._fused_gdn_gated_rms_norm(
                 x=out2d,
                 z=z,
                 weight=self.norm.weight,
                 out=out2d,
+                out_proj=self.out_proj,
                 eps=self.norm.eps,
                 num_v_heads=self.num_v_heads // self.tp_size,
                 head_v_dim=self.head_v_dim,
                 norm_before_gate=self.norm.norm_before_gate,
                 activation=self.norm.activation,
             )
-            output, _ = self.out_proj(out2d)
+            output, _ = self.out_proj(out_proj_input)
             return output
 
         # ============================================================
@@ -2003,6 +2023,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert has_initial_state is not None
         initial_state = ssm_state[attn_metadata.prefill_state_indices]
         initial_state[~has_initial_state, ...] = 0
+        # The total bounds every sequence's length, and it is known on the host.
+        use_cp: Literal["auto"] | bool = (
+            "auto"
+            if attn_metadata.num_prefill_tokens >= _FI_GDN_PREFILL_CP_MIN_TOKENS
+            else False
+        )
         plan = attn_metadata.flashinfer_checkpoint_plan
         if plan is None:
             return fi_chunk_gated_delta_rule(
@@ -2015,6 +2041,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output_final_state=True,
                 cu_seqlens=attn_metadata.prefill_query_start_loc,
                 use_qk_l2norm_in_kernel=False,
+                use_cp=use_cp,
                 output=output,
             )
 
@@ -2032,6 +2059,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             output_final_state=True,
             cu_seqlens=attn_metadata.prefill_query_start_loc,
             use_qk_l2norm_in_kernel=False,
+            use_cp=use_cp,
             output=output,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=plan.cu_starts,
