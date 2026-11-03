@@ -30,7 +30,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     resolve_quant_method,
 )
-from vllm.model_executor.utils import kernel_parameters
+from vllm.model_executor.utils import copy_weight_, kernel_parameters
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
@@ -60,6 +60,59 @@ def _index_expert_mapping(
         if expert_key.isdecimal():
             mapping_by_expert.setdefault(expert_key, []).append(entry)
     return mapping_by_expert
+
+
+def _can_load_fused_experts_at_once(
+    experts: torch.nn.Module,
+    param: torch.nn.Parameter,
+    param_name: str,
+    experts_shard: torch.Tensor,
+) -> bool:
+    """Whether a fused [E, ...] expert weight can be loaded in one call.
+
+    `weight_loader` already accepts a 3-D tensor holding every expert (its
+    `full_load` path applies the same TP narrowing and w1/w3 placement to the
+    whole tensor), which is equivalent to the per-expert loop whenever local
+    expert i is global expert i. That holds only without expert parallelism,
+    EPLB redundancy, fused shared experts or expert substitution. Restricted
+    further to the expert weight params (never their scales or biases) and to
+    sources already on an accelerator, as in online weight updates: copying a
+    TP-narrowed CPU view of the whole tensor to the device would stage a
+    contiguous device copy of all experts at once, so checkpoint loads from
+    host memory keep the per-expert copies. The parameter itself may be on
+    the meta device while layerwise reload buffers the call.
+
+    The parameter's loader must be `RoutedExperts.weight_loader` itself (seen
+    through the layerwise reload wrapper): quantization methods that install
+    their own loader for these params, e.g. Quark int4 repacking, transform
+    one 2-D expert at a time.
+    """
+    if param_name not in ("w13_weight", "w2_weight"):
+        return False
+    loader = getattr(param, "weight_loader", None)
+    while getattr(loader, "__func__", None) is not RoutedExperts.weight_loader:
+        loader = getattr(loader, "__wrapped__", None)
+        if loader is None:
+            return False
+    if experts_shard.dim() != 3 or param.data.dim() != 3:
+        return False
+    if experts_shard.device.type == "cpu":
+        return False
+    if getattr(param, "is_transposed", False):
+        return False
+    expert_map_manager = getattr(experts, "expert_map_manager", None)
+    if (
+        expert_map_manager is None
+        or expert_map_manager.expert_map is not None
+        or expert_map_manager.num_fused_shared_experts != 0
+    ):
+        return False
+    if getattr(experts, "expert_substitution", None) is not None:
+        return False
+    quant_config = getattr(experts, "quant_config", None)
+    if quant_config is not None and quant_config.get_name() == "gpt_oss_mxfp4":
+        return False
+    return experts_shard.shape[0] == param.data.shape[0]
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -389,7 +442,7 @@ class RoutedExperts(PluggableLayer):
         loaded_weight = loaded_weight.narrow(
             shard_dim, shard_size * tp_rank, shard_size
         )
-        param.copy_(loaded_weight)
+        copy_weight_(param, loaded_weight)
 
     def _load_model_weight_or_group_weight_scale(
         self,
@@ -471,7 +524,7 @@ class RoutedExperts(PluggableLayer):
                 hidden_dim=hidden_dim,
                 shard_dim=shard_dim,
             )
-            expert_data.copy_(loaded_weight)
+            copy_weight_(expert_data, loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -598,7 +651,7 @@ class RoutedExperts(PluggableLayer):
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
+        copy_weight_(expert_data, loaded_weight)
 
     def _load_w2(
         self,
@@ -647,9 +700,9 @@ class RoutedExperts(PluggableLayer):
                 expert_data.chunk(num_chunks, dim=0),
                 loaded_weight.chunk(num_chunks, dim=0),
             ):
-                dst.copy_(src)
+                copy_weight_(dst, src)
             return
-        expert_data.copy_(loaded_weight)
+        copy_weight_(expert_data, loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
@@ -697,11 +750,11 @@ class RoutedExperts(PluggableLayer):
             # (FIXME) for gpt-oss all experts are combined
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
+                copy_weight_(param.data[:, :dim1], loaded_weight)
             else:
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                copy_weight_(param.data[:, :dim1, :dim2], loaded_weight)
             return True if return_success else None
 
         from vllm.model_executor.layers.quantization.online.moe_base import (
@@ -812,7 +865,7 @@ class RoutedExperts(PluggableLayer):
                     loaded_weight,
                     hidden_dim=0,
                 )
-                expert_data.copy_(loaded_weight)
+                copy_weight_(expert_data, loaded_weight)
             else:
                 self._load_w13(
                     shard_id=shard_id,
@@ -1086,6 +1139,34 @@ class RoutedExperts(PluggableLayer):
                     # dimension to unify the loading logic with the fused case
                     experts_shard = loaded_weight.unsqueeze(0)
                     start = expert_id
+
+                if is_fused and _can_load_fused_experts_at_once(
+                    self, param, param_name, experts_shard
+                ):
+                    # One call for all experts instead of one per expert. The
+                    # per-expert calls dominate online weight updates: under
+                    # layerwise reload each call is wrapped (signature
+                    # binding, a copy-counting dispatch mode, buffering) and
+                    # replayed at layer finalization, which at 512 experts x
+                    # 3 shards costs ~125 ms of host time per layer.
+                    success = param.weight_loader(
+                        param=param,
+                        loaded_weight=experts_shard,
+                        weight_name=weight_name,
+                        shard_id=shard_id,
+                        expert_id=0,
+                        return_success=True,
+                    )
+                    if success:
+                        logger.debug(
+                            "Loaded all %d experts of shard %s into %s for layer %s",
+                            experts_shard.shape[0],
+                            shard_id,
+                            param_name,
+                            self.layer_name,
+                        )
+                        yield param_name
+                    continue
 
                 # Unified loading logic for fused and non-fused experts
                 loaded_experts = experts_shard.unbind()
